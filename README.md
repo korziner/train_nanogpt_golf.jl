@@ -1,9 +1,8 @@
 # train_nanogpt_golf.jl
-# 
-# Готовый скрипт NanoGPT-Golf + NorMuon проверен на T400 (безтензорный чип, как у популярной gtx1650).
-# Поддерживает дореформенную кириллицу (Byte-level, vocab=256).
-# Автоматически распознает JSONL или Plain Text.
-# Поддерживает чтение из bash-pipes: <(zstdcat ...)
+Готовый скрипт NanoGPT-Golf + NorMuon проверен на T400 (безтензорный чип, как у популярной gtx1650).
+Поддерживает дореформенную кириллицу (Byte-level, vocab=256).
+Автоматически распознает JSONL или Plain Text.
+Поддерживает чтение из bash-pipes: <(zstdcat ...)
 
 openai/parameter-golf tricks +NorMuon +FlashAttention via NNkernels.jl +Byte-level UTF-8 tokenizer (works for prereform Cyrillic)
 https://github.com/openai/parameter-golf Находки топовые из не требовательных к железу портированы на Julia, оптимизатор: 
