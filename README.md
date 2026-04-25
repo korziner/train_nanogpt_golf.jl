@@ -54,7 +54,7 @@ time julia -t3 train_nanogpt_golf_v6_merged.jl --data  <(zstdcat ultra22.zst|pas
 Params: 6.74M (13.48 MB FP16)
 Config: 5L d=384 heads=6 kv=3 head_dim=64 seq=1280 batch=2 accum=32 attn=flash
 
-Resuming from: ckpt_5l384_txt-1tr_ultra22/latest.jld2
+Resuming from: ckpt_5l384_ultra22/latest.jld2
 Resumed at step=6600  best_loss=1.6541209
 ⚠️  Optimizer reinitialized (old opt_state incompatible — safe)
 step  6610/25000 │ loss 1.7954 │ bpb 2.590 │ lr 2.09e-02 │ gnorm 3.59 │   2219 tok/s │ VRAM 0.04 GB free
@@ -62,7 +62,7 @@ step  6620/25000 │ loss 1.7874 │ bpb 2.579 │ lr 2.09e-02 │ gnorm 3.47 �
 step  6630/25000 │ loss 1.7811 │ bpb 2.570 │ lr 2.09e-02 │ gnorm 3.65 │   2277 tok/s │ VRAM 0.04 GB free
 step  6640/25000 │ loss 1.7685 │ bpb 2.551 │ lr 2.09e-02 │ gnorm 3.71 │   2276 tok/s │ VRAM 0.04 GB free
 step  6650/25000 │ loss 1.7774 │ bpb 2.564 │ lr 2.08e-02 │ gnorm 3.18 │   2277 tok/s │ VRAM 0.04 GB free
-  💾 ckpt saved: ckpt_5l384_txt-1tr_ultra22/latest.jld2 (best=1.6541)
+  💾 ckpt saved: ckpt_5l384_ultra22/latest.jld2 (best=1.6541)
 ...
 ```
 v6.1-MERGED • Flash • QAT • SWA/EMA, --wd и --quant int6 добавляет новая версия с полным мёржем всех фич.
