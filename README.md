@@ -1,6 +1,6 @@
 # train_nanogpt_golf.jl
 Готовый скрипт NanoGPT-Golf + NorMuon проверен на T400 (безтензорный чип, как у популярной gtx1650).
-Поддерживает дореформенную кириллицу (Byte-level, vocab=256).
+Поддерживает дореформенную кириллицу (Byte-level, hybrid: 256 raw bytes + 128 fused Cyrillic UTF-8 pairs).
 Автоматически распознает JSONL или Plain Text.
 Поддерживает чтение из bash-pipes: <(zstdcat ...)
 
