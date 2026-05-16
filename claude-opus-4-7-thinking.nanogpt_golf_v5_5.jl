@@ -12,6 +12,24 @@ using Flux, NNlib, Optimisers, Zygote, Functors
 using ArgParse, JLD2, JSON3
 using LinearAlgebra, Statistics, Random, Printf, Dates
 using CUDA
+#CUDA.math_mode(CUDA.FastMath)   # allow FMA (your FP32 FMA gave 6.13 TFLOP/s)
+CUDA.allowscalar(false)
+# Override any accidental FP16 casts
+function force_fp32!(model)
+    for p in params(model)
+        p.data = Float32.(p.data)
+    end
+end
+
+# If the script uses a "dtype" variable, set it to Float32
+dtype = Float32
+
+# Disable tensor cores entirely (they don't help on Pascal)
+ENV["CUDA_DISABLE_TENSOR_CORES"] = "1"
+
+
+# CUDA.set_runtime_version!(v"12.9"; local_toolkit=true)
+CUDA.versioninfo()
 using NNkernels
 
 using Zygote: @adjoint
@@ -21,6 +39,8 @@ const HAS_CUDA = try
 catch _
     false
 end
+
+
 
 DEV(x) = HAS_CUDA ? gpu(x) : x
 
@@ -377,7 +397,7 @@ function parse_cmd()
 
         "--min-space-ratio"; arg_type=Float64; default=0.01
         "--max-top-token-ratio"; arg_type=Float64; default=0.65
-        "--max-prefix-ratio"; arg_type=Float64; default=0.85   # cyr2 share bound
+        "--max-prefix-ratio"; arg_type=Float64; default=0.95   # cyr2 share bound
         "--max-repeat-run"; arg_type=Int; default=96
         "--min-unique-ratio"; arg_type=Float64; default=0.02
         "--min-sample-entropy"; arg_type=Float64; default=1.4
@@ -1186,8 +1206,8 @@ function loss_is_suspicious(avg_loss::Float32, loss_ema::Float32,
         end
     end
     if isfinite(best_loss) && best_loss < 100f0
-        if avg_loss > 1.35f0 * best_loss
-            return true, @sprintf("loss drift %.4f > 1.35x best %.4f", avg_loss, best_loss)
+        if avg_loss > Float32(args["loss-spike-factor"])  * best_loss
+            return true, @sprintf("loss drift %.4f >  %.2fx best %.4f", avg_loss, args["loss-spike-factor"], best_loss)
         end
     end
     return false, "ok"
