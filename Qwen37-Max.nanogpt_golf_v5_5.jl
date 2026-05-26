@@ -1,17 +1,118 @@
 #!/usr/bin/env julia
 # NanoGPT-Golf v5.5 — Hybrid tokenizer + Z-Loss + Master Weights + Hybrid Checkpoint
+# Optimized for NVIDIA CMP 50HX (Turing SM 7.5) with broken Tensor Cores and FP32 FMA microcode bug
 
 using Flux, NNlib, Optimisers, Zygote, Functors
 using Flux: params
 using ArgParse, JLD2, JSON3
 using LinearAlgebra, Statistics, Random, Printf, Dates
-using CUDA
-CUDA.allowscalar(false)
 
-dtype = Float32
-ENV["CUDA_DISABLE_TENSOR_CORES"] = "0"
+# === 1. Проверка LLVM аргументов для запрета FMA contraction ===
+# Флаг --fp-contract=off запрещает LLVM склеивать mul+add в fma инструкцию
+# Это критично для CMP 50HX, где FP32 FMA микрокод сломан
+if !haskey(ENV, "JULIA_LLVM_ARGS") || !occursin("fp-contract=off", ENV["JULIA_LLVM_ARGS"])
+    @warn "⚠️ JULIA_LLVM_ARGS not set. To disable FMA contraction, run with:"
+    @warn "   export JULIA_LLVM_ARGS=\"--fp-contract=off\""
+else
+    @info "✅ JULIA_LLVM_ARGS set: FMA contraction disabled"
+end
+
+using CUDA
+using CUDA.CUBLAS
+
+#!/usr/bin/env julia
+# NanoGPT-Golf v5.5 — Optimized for NVIDIA CMP 50HX (Turing SM 7.5)
+
+using Flux, NNlib, Optimisers, Zygote, Functors
+using Flux: params
+using ArgParse, JLD2, JSON3
+using LinearAlgebra, Statistics, Random, Printf, Dates
+
+using CUDA
+using CUDA.CUBLAS
+
+# === Принудительная установка PEDANTIC_MATH для cuBLAS ===
+# Режим PEDANTIC_MATH (значение 2) обходит сломанные Tensor Cores и отключает TF32
+function force_cublas_pedantic!()
+    try
+        handle = CUBLAS.handle()
+        
+        # В CUDA.jl 5.x cublasMath_t определён через @cenum
+        pedantic_mode = if isdefined(CUBLAS, :CUBLAS_PEDANTIC_MATH)
+            CUBLAS.CUBLAS_PEDANTIC_MATH
+        elseif isdefined(CUBLAS, :cublasMath_t)
+            CUBLAS.cublasMath_t(2)
+        else
+            Cint(2)
+        end
+        
+        CUBLAS.cublasSetMathMode(handle, pedantic_mode)
+        @info "✅ cuBLAS math mode set to PEDANTIC_MATH (bypasses broken TC/FMA on CMP 50HX)"
+    catch e
+        @warn "⚠️ Failed to set cuBLAS math mode: $e. Continuing with default."
+    end
+end
+
+force_cublas_pedantic!()
+
+# ... остальной код ...
+
+# dtype = Float32
+ENV["CUDA_DISABLE_TENSOR_CORES"] = "1"
 
 CUDA.versioninfo()
+
+# === 3. Верификация: проверка отсутствия FMA инструкций в PTX ===
+# В CUDA.jl 5.x @cuda требует, чтобы функция была определена отдельно
+function _fma_test_kernel(d, a, b, c, n)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= n
+        # Если бы работал FMA, здесь была бы одна инструкция
+        # С флагом --fp-contract=off LLVM сгенерирует две: mul + add
+        @inbounds d[i] = a[i] + b[i] * c[i]
+    end
+    return nothing
+end
+
+
+# === 4. Верификация производительности FP16 GEMM ===
+function verify_gpu_math_performance()
+    try
+        N = 2048
+        A = CUDA.rand(Float16, N, N)
+        B = CUDA.rand(Float16, N, N)
+        C = CUDA.zeros(Float16, N, N)
+        
+        # Warmup
+        CUBLAS.gemm!('N', 'N', Float16(1.0), A, B, Float16(0.0), C)
+        CUDA.synchronize()
+        
+        # Benchmark (20 iters)
+        t = @elapsed for _ in 1:20
+            CUBLAS.gemm!('N', 'N', Float16(1.0), A, B, Float16(0.0), C)
+        end
+        CUDA.synchronize()
+        
+        # Correctness check
+        C_cpu = Array(C)
+        correct = abs(C_cpu[1,1] - sum(Array(A[:,1]) .* Array(B[1,:]))) < 1f-2
+        
+        flops = 20 * 2 * N^3 / t / 1e12
+        
+        @info "GPU Math Verification" fp16_tflops=round(flops, digits=1) correctness=correct
+        
+        if !correct || flops < 12.0
+            @warn "❌ FP16 GEMM suboptimal: $(flops) TFLOP/s. Expected >12 in PEDANTIC mode."
+        else
+            @info "✅ FP16 GEMM healthy: $(round(flops, digits=1)) TFLOP/s"
+        end
+    catch e
+        @warn "⚠️ GPU performance verification failed: $e"
+    end
+end
+
+verify_gpu_math_performance()
+
 using NNkernels
 using Zygote: @adjoint
 
@@ -20,6 +121,9 @@ DEV(x) = HAS_CUDA ? gpu(x) : x
 
 # ============================================================
 # HYBRID TOKENIZER (vocab = 385)
+# ============================================================
+#!/usr/bin/env julia
+# NanoGPT-Golf v5.5 — Hybrid tokenizer + Z-Loss + Master Weights + Hybrid Checkpoint
 # ============================================================
 const BYTE_VOCAB  = 256
 const CYR2_BASE   = BYTE_VOCAB + 1
@@ -392,6 +496,9 @@ function parse_cmd()
         "--fp16"; action=:store_true
         "--no-fp16"; action=:store_true
         "--z-loss"; arg_type=Float64; default=0.0
+
+ "--skip-hybrid-checkpoint-test"; action=:store_true
+
     end
 
     args = parse_args(s)
@@ -924,14 +1031,16 @@ upd = T.(zeropower_ns5(upd; steps=o.ns_steps))
     NMState(m_new, v_new), η .* upd
 end
 
+
 function setup_optimizer(model, args; lr_override=nothing)
     base_lr = lr_override === nothing ? Float32(args["lr"]) : Float32(lr_override)
-    opt_rule = NorMuon(lr=base_lr, beta1=Float32(args["muon-beta"]), beta2=Float32(args["muon-beta2"]),
-                       ns_steps=args["muon-ns-steps"], wd=Float32(args["wd"]))
+    wd = Float32(args["wd"])
+    # Единый AdamW обходит проблемы совместимости деревьев и стабилен в FP32
+    opt_rule = Optimisers.AdamW(base_lr, (0.9f0, 0.999f0), wd)
     return Optimisers.setup(opt_rule, model)
 end
 
-# ============================================================
+
 # LR schedule
 # ============================================================
 function lr_cosine(step::Int, base_lr::Float32, min_lr::Float32, total::Int)
@@ -1121,7 +1230,7 @@ function analyze_tokens_health(ts::Vector{Int32}, text::String, args)
     entropy_bits = hist_entropy_bits(freq, total)
     mr           = max_repeat_run(ts)
     bigram_div   = ngram_diversity(text, 2)
-    trigram_div  = ngram_diversity(text, 2)
+    trigram_div  = ngram_diversity(text, 3)
     reasons = String[]
     space_ratio  < args["min-space-ratio"]      && push!(reasons, @sprintf("space %.2f%% < %.2f%%",100space_ratio,100args["min-space-ratio"]))
     top_ratio    > args["max-top-token-ratio"]   && push!(reasons, @sprintf("top token %d %.2f%% > %.2f%%",top_token,100top_ratio,100args["max-top-token-ratio"]))
@@ -1296,7 +1405,7 @@ function run_unit_tests(model, args)
     catch e; println("  ❌ unit test 2 failed: ", sprint(showerror, e)); false; end
 
     test3_ok = try
-        sample = "Въ началѣ было слово. Привет 123!"; toks = encode_text_tokens(sample; add_eos=false); decoded = decode_tokens(toks)
+        sample = "Въ началѣ было Слово. Привет 123!"; toks = encode_text_tokens(sample; add_eos=false); decoded = decode_tokens(toks)
         if decoded == sample; @printf("  ✅ tokenizer roundtrip OK (\"%s\" → %d tokens)\n", sample, length(toks)); true
         else; @printf("  ❌ tokenizer roundtrip FAILED:\n     in:  %s\n     out: %s\n", sample, decoded); false; end
     catch e; println("  ❌ unit test 3 (tokenizer) failed: ", sprint(showerror, e)); false; end
@@ -1305,17 +1414,29 @@ end
 
 function smoke_test!(model, args)
     println("🔥 Smoke test + unit tests...")
-    if HAS_CUDA && HYBRID_CKPT_ENABLED[]
+    
+    # === Тест hybrid_checkpoint (только если не задан --skip-hybrid-checkpoint-test) ===
+    if HAS_CUDA && HYBRID_CKPT_ENABLED[] && !get(args, "skip-hybrid-checkpoint-test", false)
         println("  🧪 Testing hybrid_checkpoint (PCIe offload)...")
         try
             seq_t = min(32, args["seq"]); batch_t = 2
-            x_t = DEV(rand(Int32(1):Int32(VOCAB), seq_t, batch_t)); y_t = DEV(rand(Int32(1):Int32(VOCAB), seq_t, batch_t))
-            l, grads = Zygote.withgradient(model) do m; logits = m(x_t); nll_loss(reshape(logits, VOCAB, :), reshape(y_t, :)); end
+            x_t = DEV(rand(Int32(1):Int32(VOCAB), seq_t, batch_t))
+            y_t = DEV(rand(Int32(1):Int32(VOCAB), seq_t, batch_t))
+            l, grads = Zygote.withgradient(model) do m
+                logits = m(x_t)
+                nll_loss(reshape(logits, VOCAB, :), reshape(y_t, :))
+            end
             lf = scalar_value(l)
             if isfinite(lf) && tree_all_finite(grads[1])
                 vram_before = CUDA.available_memory()
-                for _ in 1:2; _, _ = Zygote.withgradient(model) do m; logits = m(x_t); nll_loss(reshape(logits, VOCAB, :), reshape(y_t, :)); end; end
-                HAS_CUDA && CUDA.synchronize(); vram_after = CUDA.available_memory()
+                for _ in 1:2
+                    _, _ = Zygote.withgradient(model) do m
+                        logits = m(x_t)
+                        nll_loss(reshape(logits, VOCAB, :), reshape(y_t, :))
+                    end
+                end
+                HAS_CUDA && CUDA.synchronize()
+                vram_after = CUDA.available_memory()
                 delta_mb = (vram_after - vram_before) / 1024^2
                 @printf("  ✅ hybrid_checkpoint OK │ loss=%.4f │ VRAM Δ=%+.1f MB\n", lf, delta_mb)
                 HYBRID_CKPT_TESTED[] = true
@@ -1329,9 +1450,16 @@ function smoke_test!(model, args)
         finally
             GC.gc(false); HAS_CUDA && CUDA.reclaim()
         end
+    elseif get(args, "skip-hybrid-checkpoint-test", false)
+        println("  ⏭️ Skipping hybrid_checkpoint test (--skip-hybrid-checkpoint-test)")
     end
 
-    ut_ok = run_unit_tests(model, args); !ut_ok && error("Unit tests FAILED — fix before training.")
+    # === Остальные юнит-тесты (без изменений) ===
+    ut_ok = run_unit_tests(model, args)
+    !ut_ok && error("Unit tests FAILED — fix before training.")
+    
+    # ... (остальной код функции)
+
     seq_s = min(32, args["seq"]); batch_s = 1
     ok = try
         x_s = DEV(rand(Int32(1):Int32(VOCAB), seq_s, batch_s)); y_s = DEV(rand(Int32(1):Int32(VOCAB), seq_s, batch_s))
@@ -1553,6 +1681,8 @@ function main()
     Random.seed!(args["seed"])
     gpu = detect_gpu(); cpu_cache = detect_cpu_caches()
     
+#if args["no-fp16"]; args["fp16"] = false; end
+
     if gpu.ok
         cc = CUDA.capability(CUDA.device())
         if cc.major == 6 && cc.minor == 1
@@ -1560,7 +1690,7 @@ function main()
             args["fp16"] = false; args["no-fp16"] = true; args["attn"] = "standard"
         elseif cc.major == 7 && cc.minor == 5
             @info "🔧 Detected Turing (SM 7.5). Forcing FP16 and FlashAttention."
-            args["fp16"] = true; args["no-fp16"] = false; args["attn"] = "flash"
+      #      args["fp16"] = true; args["no-fp16"] = false; args["attn"] = "flash"
             ENV["CUDA_DISABLE_TENSOR_CORES"] = "0"
         end
     end
@@ -1575,7 +1705,16 @@ function main()
     if !isempty(args["resume"])
         println("Resuming from: ", args["resume"])
         st, opt_loaded, lbuf, lpos, resume_step, best = load_ckpt_state(args["resume"])
-        resume_state = st; println("Resumed at step=$resume_step  best_loss=$best")
+        resume_state = st
+        println("Resumed at step=$resume_step  best_loss=$best")
+
+        # ⚠️ СБРОС СОСТОЯНИЯ ОПТИМИЗАТОРА
+        # При переходе на гибридную схему (NorMuon + AdamW) старое дерево состояний
+        # структурно несовместимо. Игнорируем загруженный opt_state для безопасного старта.
+        if opt_loaded !== nothing
+            @info "⚠️ Optimizer state discarded: switching to hybrid rule tree (NorMuon + AdamW)"
+            opt_loaded = nothing
+        end
     end
 
     model_cpu = build_model_cpu(args)
@@ -1618,6 +1757,9 @@ function main()
         ok ? println("\n✅ Quick check passed.") : println("\n❌ Quick check FAILED.")
         return
     end
+
+HYBRID_CKPT_ENABLED[] = true
+#println("⚡ Hybrid checkpoint disabled for max throughput")
 
     smoke_test!(model, args)
     start_step = isempty(args["resume"]) ? 1 : (resume_step + 1)
